@@ -497,6 +497,49 @@ prop_read_empty k = ioProperty $ do
   t <- runAWSDefaultRegion . read $ Address bucket' k
   pure $ t === Nothing
 
+prop_download_recursive :: Property
+prop_download_recursive = once . testAWS $ do
+  let name1 = "first name"
+      name2 = "second name"
+      name3 = "third name"
+  tmpdir <- newFilePath
+  addr <- withKey (// Key "top") <$> newAddress
+  writeOrFail (withKey (// Key "a") addr) name1
+  writeOrFail (withKey (// Key "b/c") addr) name2
+  writeOrFail (withKey (// Key "c/d/e") addr) name3
+
+  eitherT (fail . show) pure $ downloadRecursive addr tmpdir
+
+  a <- liftIO $ T.readFile (tmpdir </> "a")
+  c <- liftIO $ T.readFile (tmpdir </> "b" </> "c")
+  e <- liftIO $ T.readFile (tmpdir </> "c" </> "d" </> "e")
+
+  pure $ a === name1 .&&. c == name2 .&&. e == name3
+
+prop_upload_recursive :: Property
+prop_upload_recursive = once . testAWS $ do
+  let name1 = "first name"
+      name2 = "second name"
+      name3 = "third name"
+  tmpdir <- newFilePath
+  liftIO $ do
+    D.createDirectoryIfMissing True (tmpdir </> "b")
+    D.createDirectoryIfMissing True (tmpdir </> "c" </> "d")
+
+    T.writeFile (tmpdir </> "a") name1
+    T.writeFile (tmpdir </> "b" </> "c") name2
+    T.writeFile (tmpdir </> "c" </> "d" </> "e") name3
+
+  addr <- withKey (// Key "top") <$> newAddress
+
+  eitherT (fail . show) pure $ uploadRecursive tmpdir addr 2
+
+  a <- read (withKey (// Key "a") addr)
+  c <- read (withKey (// Key "b/c") addr)
+  e <- read (withKey (// Key "c/d/e") addr)
+
+  pure $ a === Just name1 .&&. c == Just name2 .&&. e == Just name3
+
 ----------
 -- HELPERS
 ----------

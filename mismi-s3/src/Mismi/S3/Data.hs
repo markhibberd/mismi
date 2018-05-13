@@ -41,10 +41,10 @@ module Mismi.S3.Data (
   , sse
   ) where
 
-import           Control.Exception.Base
+import           Control.Exception (Exception)
 
 import qualified Data.Text as T
-import           Data.Typeable
+import           Data.Typeable (Typeable)
 
 import           P
 
@@ -52,7 +52,11 @@ import           Mismi (Error, renderError)
                  -- Just for compatibility, would be good to not do
                  -- this at some point but for now we import everything
                  -- and keep current export list.
-import           Mismi.S3.Core.Data
+import           Mismi.S3.Core.Data (Address (..), Bucket (..), Key (..), ReadGrant (..)
+                                    , SyncMode (..), WriteMode (..), WriteResult (..), (//)
+                                    , addressFromText, addressToText, basename, combineKey
+                                    , dirname, foldSyncMode, foldWriteMode, removeCommonPrefix
+                                    , s3Parser, withKey)
 import           Network.AWS.S3 (ETag, ServerSideEncryption (..))
 
 import           System.FilePath (FilePath)
@@ -70,9 +74,13 @@ data S3Error =
   | DestinationAlreadyExists Address
   | DestinationDoesNotExist Address
   | DestinationFileExists FilePath
+  | DestinationNotDirectory FilePath
+  | DestinationMissing FilePath
+  | SourceNotDirectory FilePath
   | AccessDenied Address
   | Invariant Text
   | Target Address Address
+  | MissingETag
   deriving (Eq, Typeable)
 
 instance Exception S3Error
@@ -90,6 +98,12 @@ s3ErrorRender s3err = "[Mismi internal error] - " <> case s3err of
     "Can not upload to an address that already exists [" <> addressToText a <> "]"
   DestinationFileExists f ->
     "Can not download to a target that already exists [" <> T.pack f <> "]"
+  DestinationNotDirectory f ->
+    "Expecting destination " <> T.pack f <> " to be a directory."
+  DestinationMissing f ->
+    "Download destination directory " <> T.pack f <> " does not exist."
+  SourceNotDirectory f ->
+    "Recursive upload source " <> T.pack f <> " must be a directory."
   DestinationDoesNotExist a ->
     "This address does not exist [" <> addressToText a <> "]"
   AccessDenied a ->
@@ -98,6 +112,8 @@ s3ErrorRender s3err = "[Mismi internal error] - " <> case s3err of
     e
   Target a o ->
     "Can not copy [" <> addressToText a <> "] to [" <> addressToText o <> "]. Target file exists"
+  MissingETag ->
+    "missing ETag"
 
 data ErrorType =
     DownloadError
@@ -114,6 +130,8 @@ renderErrorType e = case e of
 data DownloadError =
     DownloadSourceMissing Address
   | DownloadDestinationExists FilePath
+  | DownloadDestinationNotDirectory FilePath
+  | DownloadInvariant Address Address
   | MultipartError (RunError Error)
   deriving Show
 
@@ -124,6 +142,12 @@ renderDownloadError d =
       "Can not download when the source object does not exist [" <> addressToText a <> "]"
     DownloadDestinationExists f ->
       "Can not download to a target that already exists [" <> T.pack f <> "]"
+    DownloadDestinationNotDirectory f ->
+      "Destination for a recursive download, " <> T.pack f <> " is not a directory."
+    DownloadInvariant a b ->
+      "Remove common prefix invariant: " <>
+      "[" <> addressToText b <> "] is not a common prefix of " <>
+      "[" <> addressToText a <> "]"
     MultipartError r ->
       "Multipart download error: " <> renderRunError r renderError
 
@@ -133,6 +157,7 @@ data ConcatError =
   | ConcatCopyError (RunError Error)
   | NoInputFiles
   | NoInputFilesWithData
+  | ConcatSourceTooSmall Address Int
     deriving Show
 
 renderConcatError :: ConcatError -> Text
@@ -148,6 +173,13 @@ renderConcatError e =
       "Can not concat with no input keys."
     NoInputFilesWithData ->
       "Can not concat with no input keys with data."
+    ConcatSourceTooSmall a s ->
+      T.intercalate " " [
+          "Source file"
+        , addressToText a
+        , "(" <> renderIntegral s <> ") bytes"
+        , "is too small to use as part of a multipart upload."
+        ]
 
 data CopyError =
     CopySourceMissing Address
@@ -170,6 +202,7 @@ renderCopyError e =
 data UploadError =
     UploadSourceMissing FilePath
   | UploadDestinationExists Address
+  | UploadSourceNotDirectory FilePath
   | MultipartUploadError (RunError Error)
   deriving Show
 
@@ -180,6 +213,8 @@ renderUploadError e =
       "Can not upload when the source file does not exist [" <> T.pack f <> "]"
     UploadDestinationExists a ->
       "Can not upload when the destination object already exists [" <> addressToText a <> "]"
+    UploadSourceNotDirectory f ->
+      "Recursive upload source " <> T.pack f <> " must be a directory."
     MultipartUploadError a ->
       renderRunError a ((<>) "Multipart upload failed on a worker: " . renderError)
 

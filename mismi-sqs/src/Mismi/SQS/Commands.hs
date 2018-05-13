@@ -5,6 +5,7 @@
 module Mismi.SQS.Commands (
     onQueue
   , createQueue
+  , createQueueRaw
   , deleteQueue
   , readMessages
   , writeMessage
@@ -15,7 +16,8 @@ import           Control.Lens ((^.), (.~))
 import           Control.Exception.Lens
 import           Control.Monad.Catch
 
-import           Data.Text as T
+import qualified Data.List as DL
+import qualified Data.Text as T
 import qualified Data.HashMap.Strict as M
 
 import           Mismi
@@ -33,21 +35,40 @@ onQueue (Queue q r) v action =
   within (fromMismiRegion r) (action =<< createQueue q v)
 
 -- http://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_CreateQueue.html
-createQueue :: QueueName -> Maybe Int -> AWS QueueUrl
-createQueue q v = do
+createQueueRaw :: QueueName -> Maybe Int -> AWS QueueUrl
+createQueueRaw q v = do
   res <- handleExists . send $ A.createQueue (renderQueueName q) &
            cqAttributes .~
              (M.fromList . maybeToList
-                $ ((VisibilityTimeout,) <$> ((T.pack . show) <$> v)))
+                $ ((QANVisibilityTimeout,) <$> ((T.pack . show) <$> v)))
   maybe
-    (throwM . Invariant $ "Failed to create new queue: " <> (pack . show) q)
+    (throwM . Invariant $ "Failed to create new queue: " <> (T.pack . show) q)
     (pure . QueueUrl)
     (res ^. cqrsQueueURL)
   where
-    -- If queue alsready exists (and has different VisibilityTimeout)
+    -- If queue already exists (and has different VisibilityTimeout)
     handleExists = handling _QueueNameExists $ \_ ->
       -- Get existing queue (using default parameters)
       send $ A.createQueue (renderQueueName q)
+
+-- | Returns the QueueUrl if the Queue already exists and if it doesn't.
+-- calls `createQueueRaw` to create the Queue.
+createQueue :: QueueName -> Maybe Int -> AWS QueueUrl
+createQueue q v = do
+  res <- send $ listQueues & lqQueueNamePrefix .~ Just (renderQueueName q)
+  maybe
+    (createQueueRaw q v)
+    (pure . QueueUrl)
+    (listToMaybe . filter isMatchingQueueName $ res ^. lqrsQueueURLs)
+  where
+    isMatchingQueueName url =
+      case T.split (== '/') url of
+        [] -> False
+        xs -> if DL.last xs == renderQueueName q
+                then True
+                else False
+
+
 
 -- http://docs.aws.amazon.com/AWSSimpleQueueService/latest/APIReference/API_DeleteQueue.html
 deleteQueue :: QueueUrl -> AWS ()

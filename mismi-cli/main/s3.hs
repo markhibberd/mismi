@@ -6,11 +6,11 @@ import           BuildInfo_ambiata_mismi_cli
 import           DependencyInfo_ambiata_mismi_cli
 
 import           Control.Lens (over, set)
-import           Control.Monad.IO.Class
-import           Control.Monad.Trans.Resource
+import           Control.Monad.IO.Class (MonadIO, liftIO)
+import           Control.Monad.Trans.Resource (runResourceT)
 
 import qualified Data.ByteString as BS
-import           Data.Conduit
+import           Data.Conduit ((=$=), ($$), ($$+-))
 import qualified Data.Conduit.List as DC
 import qualified Data.List as List
 import           Data.Map (Map)
@@ -25,22 +25,23 @@ import qualified Mismi.OpenSSL as O
 import           Mismi.S3
 import           Mismi.S3.Amazonka (s3)
 
-import           Options.Applicative
-
 import           P hiding (All)
 
-import           System.IO
+import           System.IO (BufferMode (..), FilePath, IO, hSetBuffering, print, stderr, stdout)
 import           System.Environment (lookupEnv)
-import           System.Exit
-import           System.FilePath
-import           System.Posix.Signals
-import           System.Posix.Process
+import           System.Exit (ExitCode (..), exitFailure, exitSuccess)
+import qualified System.FilePath as FP
+import           System.Posix.Signals (Handler (..), installHandler, sigINT, sigQUIT, sigTERM)
+import           System.Posix.Process (exitImmediately)
 
 import           Text.Printf (printf)
 
-import           X.Control.Monad.Trans.Either.Exit
+import           X.Control.Monad.Trans.Either.Exit (orDie)
 import           X.Control.Monad.Trans.Either (EitherT, eitherT, runEitherT, firstEitherT)
-import           X.Options.Applicative
+import           X.Options.Applicative (Completer, Parser, RunType (..), SafeCommand (..)
+                                       , action, auto, command', flag, flag', help, long, metavar
+                                       , pOption, option, short, value)
+import qualified X.Options.Applicative as XOA
 
 data Recursive =
     NotRecursive
@@ -67,8 +68,8 @@ data UnitPrefix =
     deriving (Eq, Show)
 
 data Command =
-    Upload FilePath Address WriteMode
-  | Download Address FilePath
+    Upload Recursive FilePath Address WriteMode Int
+  | Download Recursive Address FilePath
   | Copy Address Address WriteMode
   | Concat [Address] Address WriteMode Int
   | Move Address Address
@@ -103,7 +104,7 @@ main = do
     installHandler s (Catch . void . exitImmediately $ ExitFailure 111) Nothing
 
   f <- lookupEnv "AWS_FORCE"
-  dispatch (mismi $ parseForce f) >>= \case
+  XOA.dispatch (mismi $ parseForce f) >>= \case
       VersionCommand ->
         T.putStrLn ("s3: " <> T.pack buildInfoVersion) >> exitSuccess
       DependencyCommand ->
@@ -125,10 +126,14 @@ run c = do
   let
     e' = configure (over serviceRetry (set retryAttempts 10 . set exponentBase 0.6) s3) e
   orDie O.renderError . O.runAWS e' $ case c of
-    Upload s d m ->
+    Upload NotRecursive s d m _ ->
       uploadWithModeOrFail m s d
-    Download s d ->
+    Upload Recursive s d m f ->
+      uploadRecursiveWithModeOrFail m s d f
+    Download NotRecursive s d ->
       renderExit renderDownloadError . download s . optAppendFileName d $ key s
+    Download Recursive s d ->
+      renderExit renderDownloadError $ downloadRecursive s d
     Copy s d m ->
       renderExit renderCopyError $ copyWithMode m s d
     Concat ss d m f ->
@@ -163,6 +168,7 @@ sizeRecursive root d p =
     Summary -> do
       bytes <- sizeRecursively' root $$ DC.map sizedBytes =$= DC.fold (+) 0
       liftIO . T.putStrLn $ renderSizedAddress p (Sized bytes root)
+
 
 renderSizedAddress :: UnitPrefix -> Sized Address -> Text
 renderSizedAddress p (Sized bytes address) =
@@ -283,22 +289,22 @@ renderExit f =
 
 optAppendFileName :: FilePath -> Key -> FilePath
 optAppendFileName f k = fromMaybe f $ do
-  fp <- valueOrEmpty (hasTrailingPathSeparator f || takeFileName f == ".") (takeDirectory f)
+  fp <- valueOrEmpty (FP.hasTrailingPathSeparator f || FP.takeFileName f == ".") (FP.takeDirectory f)
   bn <- basename k
-  pure . combine fp $ T.unpack bn
+  pure . FP.combine fp $ T.unpack bn
 
 mismi :: Force -> Parser (SafeCommand Command)
 mismi f =
-  safeCommand (commandP' f <|> deprecatedCommandP')
+  XOA.safeCommand (commandP' f <|> deprecatedCommandP')
 
 commandP' :: Force -> Parser Command
-commandP' f = subparser $
+commandP' f = XOA.subparser $
      command' "upload"
               "Upload a file to s3."
-              (Upload <$> filepath' <*> address' <*> writeMode' f)
+              (Upload <$> recursive' <*> filepath' <*> address' <*> writeMode' f <*> fork')
   <> command' "download"
               "Download a file from s3."
-              (Download <$> address' <*> filepath')
+              (Download <$> recursive' <*> address' <*> filepath')
   <> command' "copy"
               "Copy a file from an S3 address to another S3 address."
               (Copy <$> address' <*> address' <*> writeMode' f)
@@ -331,8 +337,8 @@ commandP' f = subparser $
               (List <$> address' <*> recursive')
 
 deprecatedCommandP' :: Parser Command
-deprecatedCommandP' = subparser $
-  internal <> command'
+deprecatedCommandP' = XOA.subparser $
+  XOA.internal <> command'
     "read"
     "Read from an address. (Deprecated in favour of `s3 cat`.)"
     (Read <$> address')
@@ -371,26 +377,26 @@ detail' =
     <> help "Display only the combined total for a prefix."
 
 address' :: Parser Address
-address' = argument (pOption s3Parser) $
+address' = XOA.argument (pOption s3Parser) $
      metavar "S3URI"
   <> help "An s3 uri, i.e. s3://bucket/prefix/key"
-  <> completer addressCompleter
+  <> XOA.completer addressCompleter
 
 outputAddress' :: Parser Address
 outputAddress' = option (pOption s3Parser) $
      long "output"
   <> metavar "S3URI"
   <> help "An s3 uri, i.e. s3://bucket/prefix/key"
-  <> completer addressCompleter
+  <> XOA.completer addressCompleter
 
 filepath' :: Parser FilePath
-filepath' = strArgument $
+filepath' = XOA.strArgument $
      metavar "FILEPATH"
   <> help "Absolute file path, i.e. /tmp/fred"
   <> action "file"
 
 text' :: Parser Text
-text' = T.pack <$> (strArgument $
+text' = T.pack <$> (XOA.strArgument $
      metavar "STRING"
   <> help "Data to write to S3 address.")
 
@@ -414,14 +420,14 @@ syncMode' =
   <|> (flag' OverwriteSync $ long "overwrite" <> help "Overwrite files that already exist in the target location.")
 
 fork' :: Parser Int
-fork' = option auto $
+fork' = XOA.option auto $
      long "fork"
   <> metavar "INT"
   <> help "Number of threads to fork CopyObject call by."
   <> value 8
 
 addressCompleter :: Completer
-addressCompleter = mkCompleter $ \s -> do
+addressCompleter = XOA.mkCompleter $ \s -> do
   res <- runEitherT (go s)
   case res of
     Left   _ -> pure []

@@ -24,6 +24,10 @@ module Mismi.S3.Commands (
   , uploadOrFail
   , uploadWithMode
   , uploadWithModeOrFail
+  , uploadRecursive
+  , uploadRecursiveOrFail
+  , uploadRecursiveWithMode
+  , uploadRecursiveWithModeOrFail
   , multipartUpload
   , uploadSingle
   , write
@@ -41,6 +45,10 @@ module Mismi.S3.Commands (
   , downloadWithModeOrFail
   , downloadSingle
   , downloadWithRange
+  , downloadRecursive
+  , downloadRecursiveOrFail
+  , downloadRecursiveWithMode
+  , downloadRecursiveWithModeOrFail
   , multipartDownload
   , listMultipartParts
   , listMultiparts
@@ -58,24 +66,32 @@ module Mismi.S3.Commands (
   , grantReadAccess
   , hoistUploadError
   , hoistDownloadError
+  , chunkFilesBySize
   ) where
 
 import           Control.Arrow ((***))
-
+import           Control.Concurrent.Async.Lifted (mapConcurrently_)
 import           Control.Exception (ioError)
+import qualified Control.Exception as CE
 import           Control.Lens ((.~), (^.), to, view)
-import           Control.Monad.Catch (throwM, onException)
-import           Control.Monad.Trans.Class (lift)
-import           Control.Monad.Trans.Resource (ResourceT, allocate, runResourceT)
+import           Control.Monad.Catch (Handler(..), throwM, onException)
+import           Control.Monad.Extra (concatMapM)
+import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Control.Monad.Reader (ask)
-import           Control.Monad.IO.Class (liftIO)
+import           Control.Monad.Trans.Class (lift)
+import           Control.Monad.Trans.Resource (ResourceT, allocate, runResourceT, liftResourceT)
+import qualified Control.Retry as Retry
 
 import qualified Data.ByteString as BS
-import           Data.Conduit (Conduit, Source, ResumableSource)
 import           Data.Conduit ((=$=), ($$), ($$+-))
+import           Data.Conduit (Conduit, Source, ResumableSource)
 import           Data.Conduit (awaitForever)
+import qualified Data.Conduit as Conduit
+import qualified Data.Conduit.Internal as Conduit (ResumableSource(..), ConduitM(..), Pipe(..))
 import           Data.Conduit.Binary (sinkFile, sinkLbs)
 import qualified Data.Conduit.List as DC
+import           Data.IORef (IORef)
+import qualified Data.IORef as IORef
 
 import qualified Data.List as L
 import qualified Data.List.NonEmpty as NEL
@@ -93,8 +109,9 @@ import           Mismi.S3.Internal
 import qualified Mismi.S3.Patch.Network as N
 import qualified Mismi.S3.Patch.PutObjectACL as P
 
-import           Network.AWS.Data.Body (RqBody (..), RsBody (..), toBody)
+import qualified Network.AWS as A
 import           Network.AWS.Data.Body (ChunkedBody (..), ChunkSize (..))
+import           Network.AWS.Data.Body (RqBody (..), RsBody (..), toBody)
 import           Network.AWS.Data.Text (toText)
 import           Network.AWS.S3 (BucketName (..))
 import           Network.AWS.S3 (GetObjectResponse, HeadObjectResponse)
@@ -108,9 +125,11 @@ import           P
 
 import           System.IO (IO, IOMode (..), SeekMode (..))
 import           System.IO (hFileSize, hSetFileSize, withFile)
-import           System.Directory (createDirectoryIfMissing, doesFileExist)
-import           System.FilePath (FilePath, takeDirectory)
+import           System.IO.Error (IOError)
+import           System.Directory (createDirectoryIfMissing, doesFileExist, getDirectoryContents)
+import           System.FilePath (FilePath, (</>), takeDirectory)
 import           System.Posix.IO (OpenMode(..), openFd, closeFd, fdSeek, defaultFileFlags)
+import           System.Posix.Files (fileSize, getFileStatus, isDirectory, isRegularFile)
 import qualified "unix-bytestring" System.Posix.IO.ByteString as UBS
 
 import           System.Timeout.Lifted (timeout)
@@ -119,14 +138,19 @@ import           System.IO.Error (userError)
 import           Twine.Data.Queue (writeQueue)
 import           Twine.Parallel (RunError (..), consume)
 
-import           X.Control.Monad.Trans.Either (EitherT, eitherT, left, right, bimapEitherT, runEitherT, newEitherT)
+import           X.Control.Monad.Trans.Either (EitherT, eitherT, left, right, bimapEitherT, hoistMaybe
+                                                , runEitherT, newEitherT)
 
 import qualified X.Data.Conduit.Binary as XB
 
+-- | Retrieves the 'HeadObjectResponse'. Handles any 404 response by converting to Maybe.
+--
 headObject :: Address -> AWS (Maybe HeadObjectResponse)
 headObject a =
   handle404 . send . f' A.headObject $ a
 
+-- | Checks for the existence of 'Address'.
+--
 exists :: Address -> AWS Bool
 exists a =
   headObject a >>= pure . isJust
@@ -178,27 +202,107 @@ takeObjectSizes b lors =
     in
       Sized bytes $ Address b (Key k)
 
+-- | Delete 'Address'
+--
 delete :: Address -> AWS ()
 delete =
   void . send . f' A.deleteObject
 
+-- | Retrieve the object at 'Address'. Handles any 404 response by converting to Maybe.
 getObject' :: Address -> AWS (Maybe GetObjectResponse)
 getObject' =
   handle404 . send . f' A.getObject
 
+-- | Read contents of 'Address'.
+--
 read :: Address -> AWS (Maybe Text)
 read a = withRetries 5 $ do
   r <- read' a
   z <- liftIO . sequence $ (runResourceT . ($$+- sinkLbs)) <$> r
   pure $ fmap (T.concat . TL.toChunks . TL.decodeUtf8) z
 
--- | WARNING : The returned @ResumableResource@ must be comsumed within the
+countBytes ::
+      IORef Int64
+   -> Source (ResourceT IO) BS.ByteString
+   -> Source (ResourceT IO) BS.ByteString
+countBytes ref src =
+  let
+    loop = do
+      mbs <- Conduit.await
+      case mbs of
+        Nothing ->
+          pure ()
+        Just bs -> do
+          liftIO $ IORef.modifyIORef' ref (+ fromIntegral (BS.length bs))
+          Conduit.yield bs
+          loop
+  in
+    src =$= loop
+
+readRange ::
+     Int
+  -> Int
+  -> Address
+  -> AWS (Source (ResourceT IO) BS.ByteString, ResourceT IO ())
+readRange start end a = do
+  result <-
+    send $
+      f' A.getObject a
+        & A.goRange .~ Just (bytesRange start end)
+
+  liftResourceT . Conduit.unwrapResumable $
+    result ^. A.gorsBody . to _streamBody
+
+readRetry ::
+     Env
+  -> Retry.RetryStatus
+  -> IORef (ResourceT IO ())
+  -> IORef Int64
+  -> Int
+  -> Address
+  -> Source (ResourceT IO) BS.ByteString
+readRetry env status0 finalizerRef startRef end a = do
+  start <- fmap fromIntegral . liftIO $ IORef.readIORef startRef
+
+  (source, finalizer) <- A.runAWS env $ readRange start end a
+  liftIO $ IORef.writeIORef finalizerRef finalizer
+
+  Conduit.catchC (countBytes startRef source) $ \(err :: CE.SomeException) -> do
+    status <- liftIO $ throwOrRetry 5 err status0
+    readRetry env status finalizerRef startRef end a
+
+newResumableSource :: Source m a -> m () -> ResumableSource m a
+newResumableSource (Conduit.ConduitM source) final =
+  Conduit.ResumableSource (source Conduit.Done) final
+
+-- | WARNING : The returned @ResumableResource@ must be consumed within the
 -- @AWS@ monad. Failure to do so can result in run time errors (recv on a bad
 -- file descriptor) when the @MonadResouce@ cleans up the socket.
 read' :: Address -> AWS (Maybe (ResumableSource (ResourceT IO) BS.ByteString))
 read' a = do
-  r <- getObject' a
-  pure $ fmap (^. A.gorsBody . to _streamBody) r
+  env <- ask
+  startRef <- liftIO $ IORef.newIORef 0
+  mend <- getSize a
+  case mend of
+    Nothing ->
+      pure Nothing
+
+    Just 0 ->
+      pure . Just $ newResumableSource mempty (pure ())
+
+    Just end -> do
+      finalizerRef <- liftIO $ IORef.newIORef (pure ())
+
+      let
+        source =
+          readRetry env Retry.defaultRetryStatus finalizerRef startRef end a
+
+        final = do
+          finalizer <- liftIO $ IORef.readIORef finalizerRef
+          finalizer
+
+      pure . Just $
+        newResumableSource source final
 
 concatMultipart :: WriteMode -> Int -> [Address] -> Address -> EitherT ConcatError AWS ()
 concatMultipart mode fork inputs dest = do
@@ -217,6 +321,7 @@ concatMultipart mode fork inputs dest = do
       Just x ->
         let
           s = fromIntegral $ unBytes x
+          minChunk = 5 * 1024 * 1024 -- 5 MiB
           chunk = 1024 * 1024 * 1024 -- 1 gb
           big = 5 * 1024 * 1024 -- 5 gb
         in
@@ -224,14 +329,18 @@ concatMultipart mode fork inputs dest = do
             True ->
               pure Nothing
             False ->
-              case s < big of
+              case s < minChunk of
                 True ->
-                  pure $ Just [(input, 0, s)]
+                  left $ ConcatSourceTooSmall input s
                 False ->
-                  let
-                    chunks = calculateChunksCapped s chunk 4096
-                  in
-                    pure . Just $ (\(a, b, _) -> (input, a, b)) <$> chunks
+                  case s < big of
+                    True ->
+                      pure $ Just [(input, 0, s)]
+                    False ->
+                      let
+                        chunks = calculateChunksCapped s chunk 4096
+                      in
+                        pure . Just $ (\(a, b, _) -> (input, a, b)) <$> chunks
 
   when (null things) $
     left NoInputFilesWithData
@@ -282,7 +391,7 @@ copyWithMode mode s d = do
 copySingle :: Address -> Address -> AWS ()
 copySingle (Address (Bucket sb) (Key sk)) (Address (Bucket b) (Key dk)) =
   void . send $ A.copyObject (BucketName b) (sb <> "/" <> sk) (ObjectKey dk)
-     & A.coServerSideEncryption .~ Just sse & A.coMetadataDirective .~ Just Copy
+     & A.coServerSideEncryption .~ Just sse & A.coMetadataDirective .~ Just MDCopy
 
 copyMultipart :: Address -> Address -> Int -> Int -> Int -> EitherT CopyError AWS ()
 copyMultipart source dest sz chunk fork = do
@@ -328,15 +437,16 @@ multipartCopyWorker e mpu dest (source, o, c, i) = do
       A.uploadPartCopy (BucketName db) (sb <> "/" <> sk) (ObjectKey dk) i mpu
         & A.upcCopySourceRange .~ (Just $ bytesRange o (o + c - 1))
 
-  r <- runEitherT . runAWS e $ send req
-  case r of
-    Left z ->
-      pure $! Left z
+  Retry.recovering (Retry.fullJitterBackoff 500000) [s3Condition] $ \_ -> do
+    r <- runEitherT . runAWS e $ send req
+    case r of
+      Left z ->
+        pure $! Left z
 
-    Right z -> do
-      pr <- fromMaybeM (throwM . Invariant $ "upcrsCopyPartResult") $ z ^. A.upcrsCopyPartResult
-      m <- fromMaybeM (throwM . Invariant $ "cprETag") $ pr ^. A.cprETag
-      pure $! Right $! PartResponse i m
+      Right z -> do
+        pr <- fromMaybeM (throwM . Invariant $ "upcrsCopyPartResult") $ z ^. A.upcrsCopyPartResult
+        m <- fromMaybeM (throwM . Invariant $ "cprETag") $ pr ^. A.cprETag
+        pure $! Right $! PartResponse i m
 
 createMultipartUpload :: Address -> AWS Text
 createMultipartUpload a = do
@@ -352,6 +462,14 @@ upload :: FilePath -> Address -> EitherT UploadError AWS ()
 upload =
   uploadWithMode Fail
 
+uploadRecursive :: FilePath -> Address -> Int -> EitherT UploadError AWS ()
+uploadRecursive =
+  uploadRecursiveWithMode Fail
+
+uploadRecursiveOrFail :: FilePath -> Address -> Int -> AWS ()
+uploadRecursiveOrFail f a i =
+  eitherT hoistUploadError pure $ uploadRecursive f a i
+
 uploadOrFail :: FilePath -> Address -> AWS ()
 uploadOrFail f a =
   eitherT hoistUploadError pure $ upload f a
@@ -360,6 +478,10 @@ uploadWithModeOrFail :: WriteMode -> FilePath -> Address -> AWS ()
 uploadWithModeOrFail w f a =
   eitherT hoistUploadError pure $ uploadWithMode w f a
 
+uploadRecursiveWithModeOrFail :: WriteMode -> FilePath -> Address -> Int -> AWS ()
+uploadRecursiveWithModeOrFail w f a i =
+  eitherT hoistUploadError pure $ uploadRecursiveWithMode w f a i
+
 hoistUploadError :: UploadError -> AWS ()
 hoistUploadError e =
   case e of
@@ -367,6 +489,8 @@ hoistUploadError e =
       throwM $ SourceFileMissing f
     UploadDestinationExists a ->
       throwM $ DestinationAlreadyExists a
+    UploadSourceNotDirectory f ->
+      throwM $ SourceNotDirectory f
     MultipartUploadError (WorkerError a) ->
       throwM $ a
     MultipartUploadError (BlowUpError a) ->
@@ -378,16 +502,26 @@ uploadWithMode m f a = do
   unlessM (liftIO $ doesFileExist f) . left $ UploadSourceMissing f
   s <- liftIO $ withFile f ReadMode $ \h ->
     hFileSize h
-  let chunk = 100 * 1024 * 1024
-  case s < chunk of
+  case s < bigChunkSize of
     True ->
       lift $ uploadSingle f a
     False ->
+      -- Originally had a concurrency of 100 (instead of 20).
+      --
+      -- Based on the reasoning behind downloadWithMode which resulted in a 5
+      -- as it's concurrency default. Testing showed that for upload 20 was a
+      -- better default.
       case s > 1024 * 1024 * 1024 of
         True ->
-          multipartUpload f a s (2 * chunk) 100
+          multipartUpload f a s (2 * bigChunkSize) 20
         False ->
-          multipartUpload f a s chunk 100
+          multipartUpload f a s bigChunkSize 20
+
+
+
+bigChunkSize :: Integer
+bigChunkSize = 100 * 1024 * 1024
+
 
 uploadSingle :: FilePath -> Address -> AWS ()
 uploadSingle file a = do
@@ -395,11 +529,11 @@ uploadSingle file a = do
   void . send $ f' A.putObject a rq & A.poServerSideEncryption .~ pure sse
 
 multipartUpload :: FilePath -> Address -> Integer -> Integer -> Int -> EitherT UploadError AWS ()
-multipartUpload file a fileSize chunk fork = do
+multipartUpload file a fSize chunk fork = do
   e <- ask
   mpu <- lift $ createMultipartUpload a
 
-  let chunks = calculateChunksCapped (fromInteger fileSize) (fromInteger chunk) 4096 -- max 4096 prts returned
+  let chunks = calculateChunksCapped (fromInteger fSize) (fromInteger chunk) 4096 -- max 4096 prts returned
 
   r <- liftIO $
     consume (forM_ chunks . writeQueue) fork $ multipartUploadWorker e mpu file a
@@ -419,23 +553,98 @@ multipartUpload file a fileSize chunk fork = do
 
 multipartUploadWorker :: Env -> Text -> FilePath -> Address -> (Int, Int, Int) -> IO (Either Error PartResponse)
 multipartUploadWorker e mpu file a (o, c, i) =
-  withFile file ReadMode $ \h -> do
-    req' <- liftIO $ do
-      let cs = (1024 * 1024) -- 1 mb
-          cl = toInteger c
-          b = XB.slurpHandle h (toInteger o) (Just $ toInteger c)
-          cb = ChunkedBody cs cl b
-      return . f' A.uploadPart a i mpu $ Chunked cb
+  withFile file ReadMode $ \h ->
+    let
+      cs = (1024 * 1024) -- 1 mb
+      cl = toInteger c
+      b = XB.slurpHandle h (toInteger o) (Just $ toInteger c)
+      cb = ChunkedBody cs cl b
+      req' = f' A.uploadPart a i mpu $ Chunked cb
+    in
+    Retry.recovering (Retry.fullJitterBackoff 500000) [s3Condition] $ \_ -> do
+      r <- runEitherT . runAWS e $ send req'
+      case r of
+        Left z ->
+          pure $! Left z
+        Right z -> do
+          m <- fromMaybeM (throwM MissingETag) $ z ^. A.uprsETag
+          pure $! Right $! PartResponse i m
 
-    r <- runEitherT . runAWS e $ send req'
-    case r of
-      Left z ->
-        pure $! Left z
+s3Condition :: Applicative a => Retry.RetryStatus -> Handler a Bool
+s3Condition s =
+  Handler $ \(ex :: S3Error) ->
+    pure $ case ex of
+      MissingETag ->
+        Retry.rsIterNumber s < 5
+      _ ->
+        False
 
-      Right z -> do
-        m <- fromMaybeM (throwM . Invariant $ "uprsETag") $ z ^. A.uprsETag
-        pure $! Right $! PartResponse i m
+uploadRecursiveWithMode :: WriteMode -> FilePath -> Address -> Int -> EitherT UploadError AWS ()
+uploadRecursiveWithMode mode src (Address buck ky) fork = do
+  es <- tryIO $ getFileStatus src
+  case es of
+    Left _ -> left $ UploadSourceMissing src
+    Right st -> unless (isDirectory st) . left $ UploadSourceNotDirectory src
+  files <- liftIO (listRecursivelyLocal src)
+  mapM_ uploadFiles $ chunkFilesBySize fork (fromIntegral bigChunkSize) files
+  where
+    uploadFiles :: [(FilePath, Int64)] -> EitherT UploadError AWS ()
+    uploadFiles [] = pure ()
+    uploadFiles [(f,s)]
+      | fromIntegral s < bigChunkSize = lift . uploadSingle f $ uploadAddress f
+      | otherwise = uploadWithMode mode f $ uploadAddress f
+    uploadFiles xs =
+      mapConcurrently_ (\ (f, _) -> lift . uploadSingle f $ uploadAddress f) xs
 
+
+    prefixLen = L.length (src </> "a") - 1
+
+    uploadAddress :: FilePath -> Address
+    uploadAddress fp = Address buck (ky // Key (T.pack $ L.drop prefixLen fp))
+
+-- Take a list of files and their sizes, and convert it to a list of tests
+-- where the total size of the files in the sub list is less than `maxSize`
+-- and the length of the sub lists is <= `maxCount`.
+chunkFilesBySize :: Int -> Int64 -> [(FilePath, Int64)] -> [[(FilePath, Int64)]]
+chunkFilesBySize maxCount maxSize =
+  takeFiles 0 [] . L.sortOn snd
+  where
+    takeFiles :: Int64 -> [(FilePath, Int64)] -> [(FilePath, Int64)] -> [[(FilePath, Int64)]]
+    takeFiles _ acc [] = [acc]
+    takeFiles current acc ((x, s):xs) =
+      if current + s < maxSize && L.length acc < maxCount
+        then takeFiles (current + s) ((x, s):acc) xs
+        else acc : takeFiles s [(x, s)] xs
+
+-- | Like `listRecursively` but for the local filesystem.
+-- Also returns
+listRecursivelyLocal :: MonadIO m => FilePath -> m [(FilePath, Int64)]
+listRecursivelyLocal topdir = do
+  entries <- liftIO $ listDirectory topdir
+  (dirs, files) <- liftIO . partitionDirsFilesWithSizes $ fmap (topdir </>) entries
+  others <- concatMapM listRecursivelyLocal dirs
+  pure $ files <> others
+
+
+-- Not available with ghc 7.10 so copy it here.
+listDirectory :: FilePath -> IO [FilePath]
+listDirectory path =
+  filter f <$> getDirectoryContents path
+  where
+    f filename =
+      filename /= "." && filename /= ".."
+
+partitionDirsFilesWithSizes :: MonadIO m => [FilePath] -> m ([FilePath], [(FilePath, Int64)])
+partitionDirsFilesWithSizes =
+  pworker ([], [])
+  where
+    pworker (dirs, files) [] = pure (dirs, files)
+    pworker (dirs, files) (x:xs) = do
+      xstat <- liftIO $ getFileStatus x
+      let xsize = fromIntegral $ fileSize xstat
+          newDirs = if isDirectory xstat then x : dirs else dirs
+          newFiles = if isRegularFile xstat then (x, xsize) : files else files
+      pworker (newDirs, newFiles) xs
 
 write :: Address -> Text -> AWS WriteResult
 write =
@@ -539,6 +748,10 @@ hoistDownloadError e =
       throwM $ SourceMissing DownloadError a
     DownloadDestinationExists f ->
       throwM $ DestinationFileExists f
+    DownloadDestinationNotDirectory f ->
+      throwM $ DestinationNotDirectory f
+    DownloadInvariant a b ->
+      throwM $ Invariant (renderDownloadError $ DownloadInvariant a b)
     MultipartError (WorkerError a) ->
       throwM a
     MultipartError (BlowUpError a) ->
@@ -612,6 +825,34 @@ downloadWithRange a start end dest = withRetries 5 $ do
     Just () -> pure ()
     Nothing -> liftIO $ ioError (userError "downloadWithRange timeout")
 
+downloadRecursiveWithMode :: WriteMode -> Address -> FilePath -> EitherT DownloadError AWS ()
+downloadRecursiveWithMode mode src dest = do
+  -- Check if the destination already exists and is not a directory.
+  es <- tryIO $ getFileStatus dest
+  case es of
+    Left _ -> pure ()
+    Right st -> unless (isDirectory st) . left $ DownloadDestinationNotDirectory dest
+  -- Real business starts here.
+  addrs <- lift $ listRecursively src
+  mapM_ drWorker addrs
+  where
+    drWorker :: Address -> EitherT DownloadError AWS ()
+    drWorker addr = do
+      fpdest <- hoistMaybe (DownloadInvariant addr src) $
+                    ((</>) dest) . T.unpack . unKey <$> removeCommonPrefix src addr
+      downloadWithMode mode addr fpdest
+
+downloadRecursive :: Address -> FilePath -> EitherT DownloadError AWS ()
+downloadRecursive =
+  downloadRecursiveWithMode Fail
+
+downloadRecursiveOrFail :: Address -> FilePath -> AWS ()
+downloadRecursiveOrFail a f =
+  eitherT hoistDownloadError pure $ downloadRecursive a f
+
+downloadRecursiveWithModeOrFail :: WriteMode -> Address -> FilePath -> AWS ()
+downloadRecursiveWithModeOrFail m a f =
+  eitherT hoistDownloadError pure $ downloadRecursiveWithMode m a f
 
 listMultipartParts :: Address -> Text -> AWS [Part]
 listMultipartParts a uploadId = do
@@ -697,3 +938,6 @@ worker input output mode env f = runEitherT . runAWST env SyncAws $ do
     (liftCopy $ copyWithMode Overwrite f out)
     (ifM (lift $ exists out) (right ()) cp)
     mode
+
+tryIO :: MonadIO m => IO a -> m (Either IOError a)
+tryIO = liftIO . CE.try
