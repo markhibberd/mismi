@@ -35,6 +35,11 @@ executable s3
                      , transformers
                      , unix
 
+  other-modules:     BuildInfo_ambiata_mismi_cli
+                     DependencyInfo_ambiata_mismi_cli
+  autogen-modules:   BuildInfo_ambiata_mismi_cli
+                     DependencyInfo_ambiata_mismi_cli
+
 test-suite test-cli
   type:                exitcode-stdio-1.0
 
