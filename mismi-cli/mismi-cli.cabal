@@ -29,7 +29,7 @@ executable s3
                      , exceptions
                      , filepath
                      , lens                            >= 4.8        && < 4.16
-                     , optparse-applicative            >= 0.11 && < 0.13
+                     , optparse-applicative            >= 0.11 && < 0.15
                      , resourcet
                      , text
                      , transformers

@@ -20,7 +20,6 @@ library
                      , ambiata-p
                      , ambiata-x-eithert
                      , ambiata-x-exception
-                     , bifunctors                      >= 4.2        && < 5.3
                      , bytestring                      == 0.10.*
                      -- Verison 0.2.6 of the connection package switched from Handles
                      -- to sockets which produced all kinds of odd effects. See
